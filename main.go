@@ -16,16 +16,39 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-var (
-	PROXY_HOSTS_ADDR = "lifailon@192.168.3.105:2121"
-	SSH_USERNAME     = "lifailon"
-	SSH_PORT         = "2121"
-	SSH_PASSWORD     = ""
-	SSH_KEY_PATH     = ""
-)
+type Params struct {
+	SSH_USERNAME string
+	SSH_HOSTNAME string
+	SSH_PORT     string
+}
+
+func (sshParams *Params) parseParams(host string) *Params {
+	var userName, port string
+	// Get username
+	if strings.Contains(host, "@") {
+		hostSplit := strings.Split(host, "@")
+		userName = hostSplit[0]
+		host = hostSplit[1]
+	} else {
+		userName = sshParams.SSH_USERNAME
+	}
+	// Get hostname and port
+	if strings.Contains(host, ":") {
+		hostSplit := strings.Split(host, ":")
+		host = hostSplit[0]
+		port = hostSplit[1]
+	} else {
+		port = sshParams.SSH_PORT
+	}
+	return &Params{
+		SSH_USERNAME: userName,
+		SSH_HOSTNAME: host,
+		SSH_PORT:     port,
+	}
+}
 
 func loadPrivateKey() ssh.AuthMethod {
-	// Get private key
+	// Get private key path
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		log.Fatalf("Failed to get home directory: %v", err)
@@ -48,84 +71,107 @@ func loadPrivateKey() ssh.AuthMethod {
 }
 
 func main() {
-	USERNAME := strings.Split(PROXY_HOSTS_ADDR, "@")
+	// Get environments
+	PROXY_HOSTS_LIST := "lifailon@192.168.3.105:2121,lifailon@192.168.3.106:2121" // os.Getenv("PROXY_HOSTS")
+	SSH_USERNAME := os.Getenv("SSH_USERNAME")
+	SSH_PORT := os.Getenv("SSH_PORT")
+	SSH_PASSWORD := os.Getenv("SSH_PASSWORD")
+	// DNS_HOSTS_PATH := "/etc/coredns/proxylist"
 
-	// ssh Configuration
-	sshConfig := &ssh.ClientConfig{
-		User:            USERNAME[0],
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		Timeout:         10 * time.Second,
-		Auth: []ssh.AuthMethod{
-			loadPrivateKey(),
-			ssh.Password(SSH_PASSWORD),
-		},
+	// Fill in global ssh params or use default
+	sshGloabalParams := &Params{}
+	sshGloabalParams.SSH_USERNAME = SSH_USERNAME
+	if sshGloabalParams.SSH_USERNAME == "" {
+		sshGloabalParams.SSH_USERNAME = "root"
+	}
+	sshGloabalParams.SSH_PORT = SSH_PORT
+	if sshGloabalParams.SSH_PORT == "" {
+		sshGloabalParams.SSH_PORT = "22"
 	}
 
-	// SSH Connection
-	sshClient, err := ssh.Dial("tcp", USERNAME[1], sshConfig)
-	if err != nil {
-		panic(err)
-	}
-	defer sshClient.Close()
+	// Get hosts array from string
+	PROXY_HOSTS_ARRAY := strings.Split(PROXY_HOSTS_LIST, ",")
 
-	// Create local TCP listener
-	localListener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		panic(err)
-	}
-	defer localListener.Close()
+	for _, PROXY_HOST := range PROXY_HOSTS_ARRAY {
+		// Get current ssh params
+		sshParams := sshGloabalParams.parseParams(PROXY_HOST)
 
-	go func() {
-		for {
-			localConn, err := localListener.Accept()
-			if err != nil {
-				return
-			}
-
-			// Connection to remote Docker Socket
-			remoteConn, err := sshClient.Dial("unix", "/var/run/docker.sock")
-			if err != nil {
-				localConn.Close()
-				continue
-			}
-
-			// Copy data between connections
-			go func() {
-				defer localConn.Close()
-				defer remoteConn.Close()
-				io.Copy(localConn, remoteConn)
-			}()
-			go func() {
-				defer localConn.Close()
-				defer remoteConn.Close()
-				io.Copy(remoteConn, localConn)
-			}()
+		// ssh Configuration
+		sshConfig := &ssh.ClientConfig{
+			User:            sshParams.SSH_USERNAME,
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+			Timeout:         10 * time.Second,
+			Auth: []ssh.AuthMethod{
+				loadPrivateKey(),
+				ssh.Password(SSH_PASSWORD),
+			},
 		}
-	}()
 
-	// Create Docker client for local socket
-	dockerClient, err := client.NewClientWithOpts(
-		client.WithHost("tcp://"+localListener.Addr().String()),
-		client.WithAPIVersionNegotiation(),
-	)
-	if err != nil {
-		panic(err)
-	}
-	defer dockerClient.Close()
+		// SSH Connection
+		sshClient, err := ssh.Dial("tcp", sshParams.SSH_HOSTNAME+":"+sshParams.SSH_PORT, sshConfig)
+		if err != nil {
+			panic(err)
+		}
+		defer sshClient.Close()
 
-	// Get container list
-	containers, err := dockerClient.ContainerList(context.Background(), container.ListOptions{All: true})
-	if err != nil {
-		panic(err)
-	}
+		// Create local TCP listener
+		localListener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			panic(err)
+		}
+		defer localListener.Close()
 
-	// Run docker inspect from containers
-	for _, c := range containers {
-		inspect, _ := dockerClient.ContainerInspect(context.Background(), c.ID)
-		envArr := inspect.Config.Env
-		for _, e := range envArr {
-			fmt.Println(e)
+		go func() {
+			for {
+				localConn, err := localListener.Accept()
+				if err != nil {
+					return
+				}
+
+				// Connection to remote Docker Socket
+				remoteConn, err := sshClient.Dial("unix", "/var/run/docker.sock")
+				if err != nil {
+					localConn.Close()
+					continue
+				}
+
+				// Copy data between connections
+				go func() {
+					defer localConn.Close()
+					defer remoteConn.Close()
+					io.Copy(localConn, remoteConn)
+				}()
+				go func() {
+					defer localConn.Close()
+					defer remoteConn.Close()
+					io.Copy(remoteConn, localConn)
+				}()
+			}
+		}()
+
+		// Create Docker client for local socket from ssh
+		dockerClient, err := client.NewClientWithOpts(
+			client.WithHost("tcp://"+localListener.Addr().String()),
+			client.WithAPIVersionNegotiation(),
+		)
+		if err != nil {
+			panic(err)
+		}
+		defer dockerClient.Close()
+
+		// Get container list
+		containers, err := dockerClient.ContainerList(context.Background(), container.ListOptions{All: true})
+		if err != nil {
+			panic(err)
+		}
+
+		// Run docker inspect from containers
+		for _, c := range containers {
+			inspect, _ := dockerClient.ContainerInspect(context.Background(), c.ID)
+			envArr := inspect.Config.Env
+			for _, e := range envArr {
+				fmt.Println(e)
+			}
 		}
 	}
-
 }
