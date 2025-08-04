@@ -4,13 +4,14 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -49,27 +50,30 @@ func (sshParams *Params) parseParams(host string) *Params {
 	}
 }
 
-func loadPrivateKey() ssh.AuthMethod {
+func loadPrivateKey() (ssh.AuthMethod, error) {
 	// Get private key path
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		log.Fatalf("Failed to get home directory: %v", err)
+		fmt.Printf("[ERROR] Failed to get home directory: %v\n", err)
+		return nil, err
 	}
-	keyPath := filepath.Join(homeDir, ".ssh", "id_rsa")
+	keyPath := filepath.Join(homeDir, ".ssh", "id_rsa ")
 
 	// Read private key
 	keyData, err := os.ReadFile(keyPath)
 	if err != nil {
-		log.Fatalf("Failed to read private key: %v", err)
+		fmt.Printf("[ERROR] Failed to read private key: %v\n", err)
+		return nil, err
 	}
 
 	// Get signer from private key
 	signer, err := ssh.ParsePrivateKey(keyData)
 	if err != nil {
-		log.Fatalf("Failed to parse private key: %v", err)
+		fmt.Printf("[ERROR] Failed to parse private key: %v\n", err)
+		return nil, err
 	}
 
-	return ssh.PublicKeys(signer)
+	return ssh.PublicKeys(signer), nil
 }
 
 func getVirtualHosts(sshGloabalParams Params, PROXY_IP, SSH_PASSWORD string) []string {
@@ -85,22 +89,28 @@ func getVirtualHosts(sshGloabalParams Params, PROXY_IP, SSH_PASSWORD string) []s
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         10 * time.Second,
 		Auth: []ssh.AuthMethod{
-			loadPrivateKey(),
 			ssh.Password(SSH_PASSWORD),
 		},
+	}
+
+	sshKey, err := loadPrivateKey()
+	if err == nil {
+		sshConfig.Auth = append(sshConfig.Auth, sshKey)
 	}
 
 	// SSH Connection
 	sshClient, err := ssh.Dial("tcp", sshParams.SSH_IP+":"+sshParams.SSH_PORT, sshConfig)
 	if err != nil {
-		panic(err)
+		fmt.Printf("[ERROR] Failed to connect to SSH: %v\n", err)
+		return virtualHosts
 	}
 	defer sshClient.Close()
 
 	// Create local TCP listener
 	localListener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		panic(err)
+		fmt.Printf("[ERROR] Failed to create local listener: %v\n", err)
+		return virtualHosts
 	}
 	defer localListener.Close()
 
@@ -138,14 +148,16 @@ func getVirtualHosts(sshGloabalParams Params, PROXY_IP, SSH_PASSWORD string) []s
 		client.WithAPIVersionNegotiation(),
 	)
 	if err != nil {
-		panic(err)
+		fmt.Printf("[ERROR] Failed to create Docker client: %v\n", err)
+		return virtualHosts
 	}
 	defer dockerClient.Close()
 
 	// Get container list
 	containers, err := dockerClient.ContainerList(context.Background(), container.ListOptions{All: true})
 	if err != nil {
-		panic(err)
+		fmt.Printf("[ERROR] Failed to get container list: %v\n", err)
+		return virtualHosts
 	}
 
 	// Extracting variable list from all containers
@@ -171,16 +183,21 @@ func updateHostsFile(virtualHosts []string, DNS_HOSTS_PATH string) {
 	_, err := os.Stat(DNS_HOSTS_PATH)
 	if err != nil {
 		fmt.Println("[INFO] Creating a hosts file")
+		for _, vh := range virtualHosts {
+			fmt.Printf("[DEBUG] %v\n", vh)
+		}
 		content := strings.Join(virtualHosts, "\n")
 		fmt.Printf("[INFO] Number of hosts: %v\n", len(virtualHosts))
 		err := os.WriteFile(DNS_HOSTS_PATH, []byte(content), 0644)
 		if err != nil {
-			panic(err)
+			fmt.Printf("[ERROR] Failed to write hosts file: %v\n", err)
+			return
 		}
 	} else {
 		data, err := os.ReadFile(DNS_HOSTS_PATH)
 		if err != nil {
-			panic(err)
+			fmt.Printf("[ERROR] Failed to read hosts file: %v\n", err)
+			return
 		}
 		hostData := strings.Split(string(data), "\n")
 		// Sort file data
@@ -191,12 +208,13 @@ func updateHostsFile(virtualHosts []string, DNS_HOSTS_PATH string) {
 			fmt.Printf("[INFO] Number of hosts before: %v\n", len(hostData))
 			fmt.Printf("[INFO] Number of hosts after: %v\n", len(virtualHosts))
 			for _, vh := range virtualHosts {
-				fmt.Printf("[INFO] :: %v\n", vh)
+				fmt.Printf("[DEBUG] %v\n", vh)
 			}
 			content := strings.Join(virtualHosts, "\n")
 			err := os.WriteFile(DNS_HOSTS_PATH, []byte(content), 0644)
 			if err != nil {
-				panic(err)
+				fmt.Printf("[ERROR] Failed to write hosts file: %v\n", err)
+				return
 			}
 		} else {
 			fmt.Println("[INFO] No changes found")
@@ -206,15 +224,17 @@ func updateHostsFile(virtualHosts []string, DNS_HOSTS_PATH string) {
 
 func main() {
 	// Get environments from system
-	PROXY_IP_LIST := "lifailon@192.168.3.105:2121,lifailon@192.168.3.106:2121" // os.Getenv("PROXY_HOSTS")
+	PROXY_IP_LIST := os.Getenv("PROXY_HOSTS")
 	SSH_USERNAME := os.Getenv("SSH_USERNAME")
-	SSH_PORT := os.Getenv("SSH_PORT")
 	SSH_PASSWORD := os.Getenv("SSH_PASSWORD")
-	DNS_HOSTS_PATH := "proxylist"
+	SSH_PORT := os.Getenv("SSH_PORT")
+	DNS_HOSTS_PATH := os.Getenv("DNS_HOSTS_PATH")
+	UPDATE_INTERVAL := os.Getenv("UPDATE_INTERVAL")
 
-	// Fill in global ssh params or use default
+	// Global ssh params
 	sshGloabalParams := &Params{}
 
+	// Check env and use default
 	sshGloabalParams.SSH_USERNAME = SSH_USERNAME
 	if sshGloabalParams.SSH_USERNAME == "" {
 		sshGloabalParams.SSH_USERNAME = "root"
@@ -223,17 +243,43 @@ func main() {
 	if sshGloabalParams.SSH_PORT == "" {
 		sshGloabalParams.SSH_PORT = "22"
 	}
+	if UPDATE_INTERVAL == "" {
+		UPDATE_INTERVAL = "30"
+	}
+	// Convert string to int for interval (timeout)
+	updateInterval, err := time.ParseDuration(UPDATE_INTERVAL)
+	if err != nil {
+		fmt.Printf("[ERROR] Interval format error: %v\n", err)
+		updateInterval = 30
+	}
 
 	// Get hosts array from string
 	PROXY_IP_ARRAY := strings.Split(PROXY_IP_LIST, ",")
 
-	// Get environments from docker containers
-	var virtualHosts []string
-	for _, PROXY_IP := range PROXY_IP_ARRAY {
-		vh := getVirtualHosts(*sshGloabalParams, PROXY_IP, SSH_PASSWORD)
-		virtualHosts = append(virtualHosts, vh...)
-	}
+	fmt.Println("[INFO] Hosts generation started")
 
-	// Compare the number of hosts from the environment and update the hosts file
-	updateHostsFile(virtualHosts, DNS_HOSTS_PATH)
+	// Signal channel for graceful shutdown
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	for {
+		select {
+		case <-stop:
+			fmt.Println("[INFO] Stop signal received")
+			return
+		default:
+			// Get environments from docker containers
+			var virtualHosts []string
+			for _, PROXY_IP := range PROXY_IP_ARRAY {
+				vh := getVirtualHosts(*sshGloabalParams, PROXY_IP, SSH_PASSWORD)
+				virtualHosts = append(virtualHosts, vh...)
+			}
+
+			// Compare the number of hosts from the environment and update the hosts file
+			updateHostsFile(virtualHosts, DNS_HOSTS_PATH)
+
+			// Sleep for before the next check
+			time.Sleep(updateInterval * time.Second)
+		}
+	}
 }
