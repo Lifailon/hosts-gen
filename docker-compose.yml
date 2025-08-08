@@ -1,0 +1,102 @@
+services:
+  hosts-gen:
+    container_name: hosts-gen
+    image: lifailon/hosts-gen:latest
+    restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./hostsfile:/hostsfile # hosts file used in DNS
+      - $HOME/.ssh/id_rsa:/root/.ssh/id_rsa # use private key or SSH_PASSWORD for remote connection to docker socket on proxy hosts
+      - /var/run/docker.sock:/var/run/docker.sock # for post commands
+    env_file: 
+      - .env
+
+####################################################### DNS #######################################################
+
+  # DNS Server + AdBlock
+  pihole-server:
+    container_name: pihole-server
+    image: pihole/pihole:latest
+    restart: unless-stopped
+    environment:
+      - TZ=Etc/GMT+3
+      - FTLCONF_webserver_api_password=PiHoleAdmin
+      - FTLCONF_dns_upstreams=8.8.8.8;1.1.1.1
+    volumes:
+      - ./hostsfile:/etc/hosts # hosts file used in hosts-gen
+      - ./pihole.toml:/etc/pihole/pihole.toml # use custom only HTTP port
+      - ./pihole_data:/etc/pihole
+    ports:
+      - 53:53/tcp
+      - 53:53/udp
+      - 8000:8000/tcp # HTTP for Web interface
+    network_mode: host
+    depends_on:
+      - nginx-proxy
+      - hosts-gen
+
+###################################################### Proxy ######################################################
+
+  # Proxy Server + docker-gen (need to be run on every host with Docker in the network)
+  nginx-proxy:
+    container_name: nginx-proxy
+    image: nginxproxy/nginx-proxy
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+    ports:
+      - 80:80
+      - 443:443
+    # Apply config to any container on the host (not limited to the current stack in compose)
+    network_mode: host
+
+  # Proxy Server + Web UI (use PROXY_IP_ENDPOINT in .env to use one proxy server for all hosts with Docker)
+  # nginx-proxy-manager:
+  #   container_name: nginx-proxy-manager
+  #   image: docker.io/jc21/nginx-proxy-manager:latest
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./nginx_data:/data
+  #     - ./letsencrypt:/etc/letsencrypt
+  #   ports:
+  #     - 81:81
+  #     - 80:80
+  #     - 443:443
+  #   network_mode: host
+
+##################################################### Metrics #####################################################
+
+  # Pometheus exporter for Pi-hole
+  # pihole-exporter:
+  #   container_name: pihole-exporter
+  #   image: ekofr/pihole-exporter:latest
+  #   restart: unless-stopped
+  #   environment:
+  #     # - PIHOLE_HOSTNAME=pihole-server
+  #     - PIHOLE_HOSTNAME=localhost # if pihole-server is in network_mode: host, specify the host ip address (or localhost and also use network_mode: host for exporter)
+  #     - PIHOLE_PROTOCOL=http
+  #     - PIHOLE_PORT=8000
+  #     - PIHOLE_PASSWORD=PiHoleAdmin
+  #     - INTERVAL=90s
+  #     - PORT=9617
+  #   ports:
+  #     - 9617:9617
+  #   network_mode: host
+  #   depends_on:
+  #     - pihole-server
+
+  # Pometheus exporter for Nginx
+  # nginx-exporter:
+  #   image: nginx/nginx-prometheus-exporter:latest
+  #   container_name: nginx-exporter
+  #   restart: unless-stopped
+  #   command:
+  #     # - "--nginx.scrape-uri=http://nginx-proxy:80/status"
+  #     - "--nginx.scrape-uri=http://localhost:80/status"
+  #   ports:
+  #     - "9113:9113"
+  #   network_mode: host
+  #   depends_on:
+  #     - nginx-proxy
