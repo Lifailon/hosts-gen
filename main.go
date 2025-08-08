@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"reflect"
@@ -50,40 +51,40 @@ func (sshParams *Params) parseParams(host string) *Params {
 	}
 }
 
-func loadPrivateKey() (ssh.AuthMethod, error) {
+func loadPrivateKey() ssh.AuthMethod {
 	// Get private key path
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Printf("[ERROR] Failed to get home directory: %v\n", err)
-		return nil, err
+		return nil
 	}
-	keyPath := filepath.Join(homeDir, ".ssh", "id_rsa ")
+	keyPath := filepath.Join(homeDir, ".ssh", "id_rsa")
 
 	// Read private key
 	keyData, err := os.ReadFile(keyPath)
 	if err != nil {
 		fmt.Printf("[ERROR] Failed to read private key: %v\n", err)
-		return nil, err
+		return nil
 	}
 
 	// Get signer from private key
 	signer, err := ssh.ParsePrivateKey(keyData)
 	if err != nil {
 		fmt.Printf("[ERROR] Failed to parse private key: %v\n", err)
-		return nil, err
+		return nil
 	}
 
-	return ssh.PublicKeys(signer), nil
+	return ssh.PublicKeys(signer)
 }
 
-func getVirtualHosts(sshGloabalParams Params, PROXY_IP, SSH_PASSWORD string) []string {
+func getVirtualHosts(sshGloabalParams Params, PROXY_IP, SSH_PASSWORD string, sshKey ssh.AuthMethod) []string {
 	// Array for return
 	var virtualHosts []string
 
 	// Get ssh params for current host
 	sshParams := sshGloabalParams.parseParams(PROXY_IP)
 
-	// ssh Configuration
+	// ssh configuration
 	sshConfig := &ssh.ClientConfig{
 		User:            sshParams.SSH_USERNAME,
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
@@ -93,15 +94,15 @@ func getVirtualHosts(sshGloabalParams Params, PROXY_IP, SSH_PASSWORD string) []s
 		},
 	}
 
-	sshKey, err := loadPrivateKey()
-	if err == nil {
+	// Add private key to ssh configuration
+	if sshKey != nil {
 		sshConfig.Auth = append(sshConfig.Auth, sshKey)
 	}
 
 	// SSH Connection
 	sshClient, err := ssh.Dial("tcp", sshParams.SSH_IP+":"+sshParams.SSH_PORT, sshConfig)
 	if err != nil {
-		fmt.Printf("[ERROR] Failed to connect to SSH: %v\n", err)
+		fmt.Printf("[ERROR] Failed to connect to %v via SSH: %v\n", sshParams.SSH_IP, err)
 		return virtualHosts
 	}
 	defer sshClient.Close()
@@ -176,7 +177,7 @@ func getVirtualHosts(sshGloabalParams Params, PROXY_IP, SSH_PASSWORD string) []s
 	return virtualHosts
 }
 
-func updateHostsFile(virtualHosts []string, DNS_HOSTS_PATH string) {
+func updateHostsFile(virtualHosts []string, DNS_HOSTS_PATH, POST_COMMAND string) {
 	// Sort env data
 	sort.Strings(virtualHosts)
 	// Check file
@@ -192,6 +193,16 @@ func updateHostsFile(virtualHosts []string, DNS_HOSTS_PATH string) {
 		if err != nil {
 			fmt.Printf("[ERROR] Failed to write hosts file: %v\n", err)
 			return
+		}
+		if POST_COMMAND != "" {
+			cmdParts := strings.Fields(POST_COMMAND)
+			cmd := exec.Command(cmdParts[0], cmdParts[1:]...)
+			_, err := cmd.Output()
+			if err != nil {
+				fmt.Printf("[ERROR] Error execution post command: %v\n", err)
+			} else {
+				fmt.Printf("[INFO] Execution post command: %v\n", POST_COMMAND)
+			}
 		}
 	} else {
 		data, err := os.ReadFile(DNS_HOSTS_PATH)
@@ -216,20 +227,31 @@ func updateHostsFile(virtualHosts []string, DNS_HOSTS_PATH string) {
 				fmt.Printf("[ERROR] Failed to write hosts file: %v\n", err)
 				return
 			}
-		} else {
-			fmt.Println("[INFO] No changes found")
+			if POST_COMMAND != "" {
+				cmdParts := strings.Fields(POST_COMMAND)
+				cmd := exec.Command(cmdParts[0], cmdParts[1:]...)
+				_, err := cmd.Output()
+				if err != nil {
+					fmt.Printf("[ERROR] Error execution post command: %v\n", err)
+				} else {
+					fmt.Printf("[INFO] Execution post command: %v\n", POST_COMMAND)
+				}
+			}
 		}
 	}
 }
 
 func main() {
+	fmt.Println("[INFO] Starting hosts-gen")
+
 	// Get environments from system
-	PROXY_IP_LIST := os.Getenv("PROXY_HOSTS")
+	PROXY_IP_LIST := os.Getenv("PROXY_IP_LIST")
 	SSH_USERNAME := os.Getenv("SSH_USERNAME")
 	SSH_PASSWORD := os.Getenv("SSH_PASSWORD")
 	SSH_PORT := os.Getenv("SSH_PORT")
-	DNS_HOSTS_PATH := os.Getenv("DNS_HOSTS_PATH")
 	UPDATE_INTERVAL := os.Getenv("UPDATE_INTERVAL")
+	DNS_HOSTS_PATH := os.Getenv("DNS_HOSTS_PATH")
+	POST_COMMAND := os.Getenv("POST_COMMAND")
 
 	// Global ssh params
 	sshGloabalParams := &Params{}
@@ -244,42 +266,46 @@ func main() {
 		sshGloabalParams.SSH_PORT = "22"
 	}
 	if UPDATE_INTERVAL == "" {
-		UPDATE_INTERVAL = "30"
+		UPDATE_INTERVAL = "30s"
 	}
 	// Convert string to int for interval (timeout)
 	updateInterval, err := time.ParseDuration(UPDATE_INTERVAL)
 	if err != nil {
 		fmt.Printf("[ERROR] Interval format error: %v\n", err)
-		updateInterval = 30
+		updateInterval, _ = time.ParseDuration("30s")
 	}
+
+	// Get private key
+	sshKey := loadPrivateKey()
 
 	// Get hosts array from string
 	PROXY_IP_ARRAY := strings.Split(PROXY_IP_LIST, ",")
 
-	fmt.Println("[INFO] Hosts generation started")
+	fmt.Println("[INFO] Proxy hosts:")
+	for _, proxy_ip := range PROXY_IP_ARRAY {
+		fmt.Printf("[INFO] - %v\n", proxy_ip)
+	}
 
 	// Signal channel for graceful shutdown
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
 	for {
+		// Get environments from docker containers
+		var virtualHosts []string
+		for _, PROXY_IP := range PROXY_IP_ARRAY {
+			vh := getVirtualHosts(*sshGloabalParams, PROXY_IP, SSH_PASSWORD, sshKey)
+			virtualHosts = append(virtualHosts, vh...)
+		}
+
+		// Compare the number of hosts from the environment and update the hosts file
+		updateHostsFile(virtualHosts, DNS_HOSTS_PATH, POST_COMMAND)
+
 		select {
 		case <-stop:
-			fmt.Println("[INFO] Stop signal received")
+			fmt.Println("[INFO] Stopping hosts-gen")
 			return
-		default:
-			// Get environments from docker containers
-			var virtualHosts []string
-			for _, PROXY_IP := range PROXY_IP_ARRAY {
-				vh := getVirtualHosts(*sshGloabalParams, PROXY_IP, SSH_PASSWORD)
-				virtualHosts = append(virtualHosts, vh...)
-			}
-
-			// Compare the number of hosts from the environment and update the hosts file
-			updateHostsFile(virtualHosts, DNS_HOSTS_PATH)
-
-			// Sleep for before the next check
-			time.Sleep(updateInterval * time.Second)
+		case <-time.After(updateInterval):
 		}
 	}
 }
