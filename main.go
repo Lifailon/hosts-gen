@@ -77,7 +77,7 @@ func loadPrivateKey() ssh.AuthMethod {
 	return ssh.PublicKeys(signer)
 }
 
-func getVirtualHosts(sshGloabalParams Params, PROXY_IP, SSH_PASSWORD string, sshKey ssh.AuthMethod) []string {
+func getVirtualHosts(sshGloabalParams Params, PROXY_IP, SSH_PASSWORD, PROXY_IP_ENDPOINT string, sshKey ssh.AuthMethod) []string {
 	// Array for return
 	var virtualHosts []string
 
@@ -169,7 +169,13 @@ func getVirtualHosts(sshGloabalParams Params, PROXY_IP, SSH_PASSWORD string, ssh
 		for _, e := range envArr {
 			if strings.Contains(e, "VIRTUAL_HOST=") {
 				vh := strings.ReplaceAll(e, "VIRTUAL_HOST=", "")
-				virtualHosts = append(virtualHosts, sshParams.SSH_IP+" "+vh)
+				if PROXY_IP_ENDPOINT != "" {
+					// Use one proxy for all hosts
+					virtualHosts = append(virtualHosts, PROXY_IP_ENDPOINT+" "+vh)
+				} else {
+					// One server with docker is one proxy
+					virtualHosts = append(virtualHosts, sshParams.SSH_IP+" "+vh)
+				}
 			}
 		}
 	}
@@ -246,6 +252,7 @@ func main() {
 
 	// Get environments from system
 	PROXY_IP_LIST := os.Getenv("PROXY_IP_LIST")
+	PROXY_IP_ENDPOINT := os.Getenv("PROXY_IP_ENDPOINT")
 	SSH_USERNAME := os.Getenv("SSH_USERNAME")
 	SSH_PASSWORD := os.Getenv("SSH_PASSWORD")
 	SSH_PORT := os.Getenv("SSH_PORT")
@@ -294,7 +301,7 @@ func main() {
 		// Get environments from docker containers
 		var virtualHosts []string
 		for _, PROXY_IP := range PROXY_IP_ARRAY {
-			vh := getVirtualHosts(*sshGloabalParams, PROXY_IP, SSH_PASSWORD, sshKey)
+			vh := getVirtualHosts(*sshGloabalParams, PROXY_IP, SSH_PASSWORD, PROXY_IP_ENDPOINT, sshKey)
 			virtualHosts = append(virtualHosts, vh...)
 		}
 
